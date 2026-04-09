@@ -45,12 +45,14 @@ from monai.utils import (
     ensure_tuple,
     get_equivalent_dtype,
     look_up_option,
+    optional_import,
 )
 from monai.utils.type_conversion import convert_to_dst_type
 
 __all__ = [
     "Activations",
     "AsDiscrete",
+    "RankSeg",
     "FillHoles",
     "KeepLargestConnectedComponent",
     "RemoveSmallObjects",
@@ -64,6 +66,8 @@ __all__ = [
     "GenerateHeatmap",
     "DistanceTransformEDT",
 ]
+
+RankSEG, _ = optional_import("rankseg", name="RankSEG")
 
 
 class Activations(Transform):
@@ -242,6 +246,84 @@ class AsDiscrete(Transform):
 
         img, *_ = convert_to_dst_type(img_t, img, dtype=self.kwargs.get("dtype", torch.float))
         return img
+
+
+class RankSeg(Transform):
+    """
+    Run RankSEG post-processing on probability maps.
+
+    This transform expects probability maps with shape ``(B, C, spatial...)`` and returns the
+    discrete segmentation from RankSEG.
+
+    Args:
+        metric: optimization metric passed to ``rankseg.RankSEG``.
+        mode: mode passed to ``rankseg.RankSEG``.
+        num_workers: number of workers used in RankSEG optimization.
+        device: execution device for RankSEG (e.g., ``"cpu"``).
+        solver: optimization solver passed to RankSEG.
+        output_mode: output mode passed to RankSEG.
+        use_fast: whether to use the fast path in ``RankSEG.predict``.
+        eps: epsilon passed to ``RankSEG.predict``.
+    """
+
+    backend = [TransformBackends.TORCH]
+
+    def __init__(
+        self,
+        metric: str = "iou",
+        mode: str = "multiclass",
+        num_workers: int = -1,
+        device: str = "cpu",
+        solver: str = "RMA",
+        output_mode: str = "multiclass",
+        use_fast: bool = True,
+        eps: float = 1e-6,
+    ) -> None:
+        self.metric = metric
+        self.mode = mode
+        self.num_workers = num_workers
+        self.device = device
+        self.solver = solver
+        self.output_mode = output_mode
+        self.use_fast = use_fast
+        self.eps = eps
+        self._converter = None
+
+    def _get_converter(self):
+        if self._converter is None:
+            self._converter = RankSEG(
+                metric=self.metric,
+                mode=self.mode,
+                num_workers=self.num_workers,
+                device=self.device,
+                solver=self.solver,
+                output_mode=self.output_mode,
+            )
+        return self._converter
+
+    def __call__(
+        self,
+        img: NdarrayOrTensor,
+        gt: NdarrayOrTensor | None = None,
+        use_fast: bool | None = None,
+        eps: float | None = None,
+    ) -> NdarrayOrTensor:
+        img = convert_to_tensor(img, track_meta=get_track_meta())
+        img_t, *_ = convert_data_type(img, torch.Tensor, dtype=torch.float)
+
+        gt_t = None
+        if gt is not None:
+            gt = convert_to_tensor(gt, track_meta=get_track_meta())
+            gt_t, *_ = convert_data_type(gt, torch.Tensor)
+
+        pred = self._get_converter().predict(
+            img_t,
+            gt=gt_t,
+            use_fast=self.use_fast if use_fast is None else use_fast,
+            eps=self.eps if eps is None else eps,
+        )
+        out, *_ = convert_to_dst_type(pred, img)
+        return out
 
 
 class KeepLargestConnectedComponent(Transform):

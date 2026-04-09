@@ -41,6 +41,7 @@ from monai.transforms.post.array import (
     LabelToContour,
     MeanEnsemble,
     ProbNMS,
+    RankSeg,
     RemoveSmallObjects,
     SobelGradients,
     VoteEnsemble,
@@ -58,6 +59,9 @@ __all__ = [
     "AsDiscreteD",
     "AsDiscreteDict",
     "AsDiscreted",
+    "RankSegD",
+    "RankSegDict",
+    "RankSegd",
     "Ensembled",
     "EnsembleD",
     "EnsembleDict",
@@ -212,6 +216,51 @@ class AsDiscreted(MapTransform):
             d, self.argmax, self.to_onehot, self.threshold, self.rounding
         ):
             d[key] = self.converter(d[key], argmax, to_onehot, threshold, rounding)
+        return d
+
+
+class RankSegd(MapTransform):
+    """
+    Dictionary-based wrapper of :py:class:`monai.transforms.RankSeg`.
+    """
+
+    backend = RankSeg.backend
+
+    def __init__(
+        self,
+        keys: KeysCollection,
+        gt_keys: KeysCollection | None = None,
+        metric: str = "iou",
+        mode: str = "multiclass",
+        num_workers: int = -1,
+        device: str = "cpu",
+        solver: str = "RMA",
+        output_mode: str = "multiclass",
+        use_fast: bool = True,
+        eps: float = 1e-6,
+        allow_missing_keys: bool = False,
+    ) -> None:
+        super().__init__(keys, allow_missing_keys)
+        if gt_keys is None:
+            self.gt_keys = (None,) * len(self.keys)
+        else:
+            self.gt_keys = ensure_tuple_rep(gt_keys, len(self.keys))
+        self.use_fast = ensure_tuple_rep(use_fast, len(self.keys))
+        self.eps = ensure_tuple_rep(eps, len(self.keys))
+        self.converter = RankSeg(
+            metric=metric,
+            mode=mode,
+            num_workers=num_workers,
+            device=device,
+            solver=solver,
+            output_mode=output_mode,
+        )
+
+    def __call__(self, data: Mapping[Hashable, NdarrayOrTensor]) -> dict[Hashable, NdarrayOrTensor]:
+        d = dict(data)
+        for key, gt_key, use_fast, eps in self.key_iterator(d, self.gt_keys, self.use_fast, self.eps):
+            gt = d.get(gt_key) if gt_key is not None else None
+            d[key] = self.converter(d[key], gt=gt, use_fast=use_fast, eps=eps)
         return d
 
 
@@ -1122,6 +1171,7 @@ class DistanceTransformEDTd(MapTransform):
 
 ActivationsD = ActivationsDict = Activationsd
 AsDiscreteD = AsDiscreteDict = AsDiscreted
+RankSegD = RankSegDict = RankSegd
 FillHolesD = FillHolesDict = FillHolesd
 InvertD = InvertDict = Invertd
 KeepLargestConnectedComponentD = KeepLargestConnectedComponentDict = KeepLargestConnectedComponentd

@@ -155,6 +155,10 @@ class Activationsd(MapTransform):
 class AsDiscreted(MapTransform):
     """
     Dictionary-based wrapper of :py:class:`monai.transforms.AsDiscrete`.
+    
+    Supports optional RankSEG decoding mode when ``rankseg=True`` is provided.
+    RankSEG is a training-free segmentation decoding method that requires the 
+    ``rankseg`` package to be installed separately.
     """
 
     backend = AsDiscrete.backend
@@ -166,6 +170,8 @@ class AsDiscreted(MapTransform):
         to_onehot: Sequence[int | None] | int | None = None,
         threshold: Sequence[float | None] | float | None = None,
         rounding: Sequence[str | None] | str | None = None,
+        rankseg: Sequence[bool] | bool = False,
+        rankseg_kwargs: dict | None = None,
         allow_missing_keys: bool = False,
         **kwargs,
     ) -> None:
@@ -182,10 +188,32 @@ class AsDiscreted(MapTransform):
             rounding: if not None, round the data according to the specified option,
                 available options: ["torchrounding"]. it also can be a sequence of str or None,
                 each element corresponds to a key in ``keys``.
+            rankseg: whether to use RankSEG decoder for segmentation post-processing.
+                Requires the ``rankseg`` package to be installed separately.
+                Defaults to ``False``. It also can be a sequence of bool, each element corresponds 
+                to a key in ``keys``.
+            rankseg_kwargs: dictionary of parameters to pass to ``RankSEG`` constructor when 
+                ``rankseg=True``. Common parameters include ``metric``, ``solver``, ``output_mode``, etc.
+                See https://github.com/rankseg/rankseg for details. Defaults to ``None``.
+                The same kwargs are applied to all keys.
             allow_missing_keys: don't raise exception if key is missing.
             kwargs: additional parameters to ``AsDiscrete``.
                 ``dim``, ``keepdim``, ``dtype`` are supported, unrecognized parameters will be ignored.
                 These default to ``0``, ``True``, ``torch.float`` respectively.
+
+        Raises:
+            ValueError: When both ``argmax=True`` and ``rankseg=True`` are provided for the same key.
+            ValueError: When both ``threshold`` is set and ``rankseg=True`` for the same key.
+            ValueError: When both ``rounding`` is set and ``rankseg=True`` for the same key.
+            ModuleNotFoundError: When ``rankseg=True`` but the ``rankseg`` package is not installed.
+
+        Example:
+            
+            >>> # Dictionary-style usage with RankSEG
+            >>> # post_pred = Compose([
+            >>> #     Activationsd(keys="pred", softmax=True),
+            >>> #     AsDiscreted(keys="pred", rankseg=True, rankseg_kwargs={"metric": "dice", "solver": "RMA", "output_mode": "multiclass"}),
+            >>> # ])
 
         """
         super().__init__(keys, allow_missing_keys)
@@ -203,14 +231,19 @@ class AsDiscreted(MapTransform):
             self.threshold.append(flag)
 
         self.rounding = ensure_tuple_rep(rounding, len(self.keys))
+        self.rankseg = ensure_tuple_rep(rankseg, len(self.keys))
         self.converter = AsDiscrete()
         self.converter.kwargs = kwargs
+        self.rankseg_kwargs = rankseg_kwargs if rankseg_kwargs is not None else {}
+        self.converter.rankseg_kwargs = self.rankseg_kwargs
 
     def __call__(self, data: Mapping[Hashable, NdarrayOrTensor]) -> dict[Hashable, NdarrayOrTensor]:
         d = dict(data)
-        for key, argmax, to_onehot, threshold, rounding in self.key_iterator(
-            d, self.argmax, self.to_onehot, self.threshold, self.rounding
+        for key, argmax, to_onehot, threshold, rounding, rankseg in self.key_iterator(
+            d, self.argmax, self.to_onehot, self.threshold, self.rounding, self.rankseg
         ):
+            # Update converter's rankseg setting per key
+            self.converter.rankseg = rankseg
             d[key] = self.converter(d[key], argmax, to_onehot, threshold, rounding)
         return d
 

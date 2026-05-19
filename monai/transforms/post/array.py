@@ -46,7 +46,11 @@ from monai.utils import (
     get_equivalent_dtype,
     look_up_option,
 )
+from monai.utils.module import optional_import
 from monai.utils.type_conversion import convert_to_dst_type
+
+# Optional rankseg import
+RankSEG, has_rankseg = optional_import("rankseg")
 
 __all__ = [
     "Activations",
@@ -145,6 +149,7 @@ class AsDiscrete(Transform):
         -  threshold input value to binary values.
         -  convert input value to One-Hot format (set ``to_one_hot=N``, `N` is the number of classes).
         -  round the value to the closest integer.
+        -  use RankSEG decoder (requires ``rankseg`` package to be installed separately).
 
     Args:
         argmax: whether to execute argmax function on input data before transform.
@@ -155,9 +160,22 @@ class AsDiscrete(Transform):
             Defaults to ``None``.
         rounding: if not None, round the data according to the specified option,
             available options: ["torchrounding"].
+        rankseg: whether to use RankSEG decoder for segmentation post-processing.
+            RankSEG is a training-free decoding method that consumes probability maps and produces
+            discrete segmentation masks. Requires the ``rankseg`` package to be installed separately.
+            Defaults to ``False``.
+        rankseg_kwargs: dictionary of parameters to pass to ``RankSEG`` constructor when ``rankseg=True``.
+            Common parameters include ``metric``, ``solver``, ``output_mode``, etc.
+            See https://github.com/rankseg/rankseg for details. Defaults to ``None``.
         kwargs: additional parameters to `torch.argmax`, `monai.networks.one_hot`.
             currently ``dim``, ``keepdim``, ``dtype`` are supported, unrecognized parameters will be ignored.
             These default to ``0``, ``True``, ``torch.float`` respectively.
+
+    Raises:
+        ValueError: When both ``argmax=True`` and ``rankseg=True`` are provided (mutually exclusive).
+        ValueError: When both ``threshold`` is set and ``rankseg=True`` are provided (mutually exclusive).
+        ValueError: When both ``rounding`` is set and ``rankseg=True`` are provided (mutually exclusive).
+        ModuleNotFoundError: When ``rankseg=True`` but the ``rankseg`` package is not installed.
 
     Example:
 
@@ -173,6 +191,12 @@ class AsDiscrete(Transform):
         >>> print(transform(np.array([[[0.0, 1.0]], [[2.0, 3.0]]])))
         # [[[0.0, 0.0]], [[1.0, 1.0]]]
 
+        >>> # RankSEG example (requires rankseg package installed separately)
+        >>> # post_pred = Compose([
+        >>> #     Activations(softmax=True),
+        >>> #     AsDiscrete(rankseg=True, rankseg_kwargs={"metric": "dice", "solver": "RMA", "output_mode": "multiclass"}),
+        >>> # ])
+
     """
 
     backend = [TransformBackends.TORCH]
@@ -183,6 +207,8 @@ class AsDiscrete(Transform):
         to_onehot: int | None = None,
         threshold: float | None = None,
         rounding: str | None = None,
+        rankseg: bool = False,
+        rankseg_kwargs: dict | None = None,
         **kwargs,
     ) -> None:
         self.argmax = argmax
@@ -191,6 +217,8 @@ class AsDiscrete(Transform):
         self.to_onehot = to_onehot
         self.threshold = threshold
         self.rounding = rounding
+        self.rankseg = rankseg
+        self.rankseg_kwargs = rankseg_kwargs if rankseg_kwargs is not None else {}
         self.kwargs = kwargs
 
     def __call__(
@@ -200,6 +228,7 @@ class AsDiscrete(Transform):
         to_onehot: int | None = None,
         threshold: float | None = None,
         rounding: str | None = None,
+        rankseg: bool | None = None,
     ) -> NdarrayOrTensor:
         """
         Args:
@@ -213,15 +242,43 @@ class AsDiscrete(Transform):
                 Defaults to ``self.threshold``.
             rounding: if not None, round the data according to the specified option,
                 available options: ["torchrounding"].
+            rankseg: whether to use RankSEG decoder for segmentation post-processing.
+                Defaults to ``self.rankseg``.
+
+        Raises:
+            ValueError: When both ``argmax=True`` and ``rankseg=True`` are provided (mutually exclusive).
+            ValueError: When both ``threshold`` is set and ``rankseg=True`` are provided (mutually exclusive).
+            ValueError: When both ``rounding`` is set and ``rankseg=True`` are provided (mutually exclusive).
+            ModuleNotFoundError: When ``rankseg=True`` but the ``rankseg`` package is not installed.
 
         """
         if isinstance(to_onehot, bool):
             raise ValueError("`to_onehot=True/False` is deprecated, please use `to_onehot=num_classes` instead.")
+        
+        # Resolve runtime parameters
+        argmax = self.argmax if argmax is None else argmax
+        rankseg = self.rankseg if rankseg is None else rankseg
+        
+        # Validate mutually exclusive options
+        if rankseg and argmax:
+            raise ValueError("Incompatible options: `argmax=True` and `rankseg=True` are mutually exclusive.")
+        threshold = self.threshold if threshold is None else threshold
+        if rankseg and threshold is not None:
+            raise ValueError("Incompatible options: `rankseg=True` and `threshold` are mutually exclusive.")
+        rounding = self.rounding if rounding is None else rounding
+        if rankseg and rounding is not None:
+            raise ValueError("Incompatible options: `rankseg=True` and `rounding` are mutually exclusive.")
+        
         img = convert_to_tensor(img, track_meta=get_track_meta())
         img_t, *_ = convert_data_type(img, torch.Tensor)
-        argmax = self.argmax if argmax is None else argmax
-        if argmax:
-            img_t = torch.argmax(img_t, dim=self.kwargs.get("dim", 0), keepdim=self.kwargs.get("keepdim", True))
+        
+        # Apply RankSEG decoding if requested
+        if rankseg:
+            img_t = self._apply_rankseg(img_t)
+        else:
+            # Apply traditional argmax if not using RankSEG
+            if argmax:
+                img_t = torch.argmax(img_t, dim=self.kwargs.get("dim", 0), keepdim=self.kwargs.get("keepdim", True))
 
         to_onehot = self.to_onehot if to_onehot is None else to_onehot
         if to_onehot is not None:
@@ -231,17 +288,86 @@ class AsDiscrete(Transform):
                 img_t, num_classes=to_onehot, dim=self.kwargs.get("dim", 0), dtype=self.kwargs.get("dtype", torch.float)
             )
 
-        threshold = self.threshold if threshold is None else threshold
         if threshold is not None:
             img_t = img_t >= threshold
 
-        rounding = self.rounding if rounding is None else rounding
         if rounding is not None:
             look_up_option(rounding, ["torchrounding"])
             img_t = torch.round(img_t)
 
         img, *_ = convert_to_dst_type(img_t, img, dtype=self.kwargs.get("dtype", torch.float))
         return img
+    
+    def _apply_rankseg(self, img_t: torch.Tensor) -> torch.Tensor:
+        """
+        Apply RankSEG decoding to the input probability tensor.
+        
+        Args:
+            img_t: input probability tensor, expected to be channel-first (C, spatial...)
+                or batched (B, C, spatial...). For single samples without batch dimension,
+                a batch dimension will be added temporarily.
+        
+        Returns:
+            Discrete segmentation mask tensor with shape similar to argmax output.
+        
+        Raises:
+            ModuleNotFoundError: If rankseg package is not installed.
+            ValueError: If input shape is ambiguous or invalid.
+        """
+        if not has_rankseg:
+            raise ModuleNotFoundError(
+                "RankSEG requires the `rankseg` package to be installed separately. "
+                "Please install it via `pip install rankseg`."
+            )
+        
+        # Store original device and dtype
+        orig_device = img_t.device
+        orig_dtype = img_t.dtype
+        
+        # Handle shape: MONAI uses channel-first (C, spatial...) without batch dim typically
+        # RankSEG expects batch dimension (B, C, spatial...)
+        # We assume input is (C, spatial...) for single sample
+        if img_t.ndim < 2:
+            raise ValueError(f"Input tensor must have at least 2 dimensions, got {img_t.ndim}.")
+        
+        # Check if input already has batch dimension by checking if first dim could be channels
+        # Conservative approach: assume no batch dimension if ndim <= 4 and first dim is small
+        # For typical segmentation: (C, H, W) or (C, H, W, D)
+        # We'll add batch dimension unconditionally for simplicity
+        needs_squeeze = False
+        if img_t.ndim in [3, 4] and img_t.shape[0] < 10:
+            # Likely (C, H, W) or (C, H, W, D) - add batch dim
+            img_t = img_t.unsqueeze(0)
+            needs_squeeze = True
+        elif img_t.ndim == 5:
+            # Could be (B, C, H, W, D) or (C, H, W, D, ?) - assume batched
+            pass
+        else:
+            # For other cases, assume already batched
+            pass
+        
+        # Create RankSEG instance with provided kwargs
+        rankseg_kwargs = self.rankseg_kwargs if self.rankseg_kwargs is not None else {}
+        rankseg_decoder = RankSEG(**rankseg_kwargs)
+        
+        # Call predict - RankSEG expects input on CPU typically
+        img_t_cpu = img_t.cpu() if img_t.is_cuda else img_t
+        result = rankseg_decoder.predict(img_t_cpu)
+        
+        # Ensure result is on correct device
+        result = result.to(orig_device)
+        
+        # Remove batch dimension if we added it
+        if needs_squeeze:
+            result = result.squeeze(0)
+        
+        # Apply keepdim logic similar to argmax
+        keepdim = self.kwargs.get("keepdim", True)
+        if not keepdim and result.ndim > 1:
+            # Remove the class/channel dimension (which should now be size 1 after rankseg)
+            result = result.squeeze(0)
+        
+        return result.long()
 
 
 class KeepLargestConnectedComponent(Transform):
